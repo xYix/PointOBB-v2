@@ -5,7 +5,7 @@ _base_ = [
 
 data_root = '/mnt/sdb/xuyun/datasets/DOTAv10/split_ss_dota/'
 
-store_dir = '/mnt/sdb/xuyun/PointOBB-v2/exps/exp1/cpm_dotav10/'
+store_dir = '/mnt/sdb/xuyun/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
 
 angle_version = 'le90'
 
@@ -31,11 +31,6 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
 
-# data = dict(
-    # train=dict(pipeline=train_pipeline, version=angle_version),
-    # val=dict(version=angle_version),
-    # test=dict(version=angle_version))
-
 data = dict(
     train=dict(
         pipeline=train_pipeline,
@@ -55,7 +50,7 @@ data = dict(
         classes=classes,
         samples_per_gpu=4))
 
-# model settings
+# model settings - CPM with Point-Supervised VPD
 model = dict(
     type='RotatedFCOS',
     backbone=dict(
@@ -77,9 +72,8 @@ model = dict(
         add_extra_convs='on_output',  # use P5
         num_outs=6,
         relu_before_extra_convs=True),
-    # store_dir='rotated_fcos_r50_fpn_1x_dota_le90_2',
     bbox_head=dict(
-        type='CPMHead',
+        type='CPMVPDHead',  # CPM with Point-Supervised VPD
         num_classes=len(classes),
         in_channels=256,
         stacked_convs=4,
@@ -108,9 +102,11 @@ model = dict(
     train_cfg=dict(
         visualize=False,
         store_dir=store_dir,
-        cls_weight=1.0,
-        thresh1=6,
-        alpha=1.5
+        cls_weight=20,              # Classification loss weight
+        thresh1=8,                  # Positive sample threshold
+        alpha=1,                    # Negative sample coefficient
+        use_point_supervised=True,  # Enable point-supervised mode
+        js_weight=1.0               # VPD loss weight (center + uncertainty + KL)
         ),
     test_cfg=dict(
         store_dir=store_dir,
@@ -119,6 +115,7 @@ model = dict(
         score_thr=0.05,
         nms=dict(iou_thr=0.1),
         max_per_img=2000))
+
 find_unused_parameters = True
 runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=6)
 lr_config = dict(

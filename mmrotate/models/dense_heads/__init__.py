@@ -17,6 +17,9 @@ from .rotated_retina_refine_head import RotatedRetinaRefineHead
 from .rotated_rpn_head import RotatedRPNHead
 from .sam_reppoints_head import SAMRepPointsHead
 from .cpm_head import CPMHead
+from .cpm_hbox_head import CPMHboxHead
+from .cpm_reg_head import CPMRegHead
+from .cpm_vpd_head import CPMVPDHead
 from .pseudo_label_head import PseudoLabelHead
 
 __all__ = [
@@ -25,5 +28,6 @@ __all__ = [
     'KFIoURRetinaHead', 'KFIoURRetinaRefineHead', 'KFIoUODMRefineHead',
     'RotatedRepPointsHead', 'SAMRepPointsHead', 'CSLRRetinaHead',
     'RotatedATSSHead', 'RotatedAnchorFreeHead', 'RotatedFCOSHead',
-    'CSLRFCOSHead', 'OrientedRepPointsHead', 'CPMHead', 'PseudoLabelHead'
+    'CSLRFCOSHead', 'OrientedRepPointsHead', 'CPMHead', 'CPMHboxHead',
+    'CPMRegHead', 'CPMVPDHead', 'PseudoLabelHead'
 ]

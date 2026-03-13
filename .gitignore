@@ -122,3 +122,9 @@ tmp
 
 # custom
 mmrotate/.mim
+
+# model pth
+*.pth
+
+# dataset
+.data/
