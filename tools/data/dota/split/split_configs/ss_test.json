@@ -1,7 +1,7 @@
 {
   "nproc": 10,
   "img_dirs": [
-    "/mnt/sdb/xuyun/datasets/DOTAv10/test/images/"
+    "/mnt/tmp/datasets/DOTAv10/test/images/"
   ],
   "ann_dirs": null,
   "sizes": [
@@ -21,6 +21,6 @@
     116,
     124
   ],
-  "save_dir": "/mnt/sdb/xuyun/datasets/DOTAv10/split_ss_dota/test/",
+  "save_dir": "/mnt/tmp/datasets/DOTAv10/split_ss_dota/test/",
   "save_ext": ".png"
 }

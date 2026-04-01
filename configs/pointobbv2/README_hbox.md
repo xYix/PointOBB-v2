@@ -65,4 +65,4 @@ python tools/test.py configs/pointobbv2/train_cpm_hbox_dotav10.py \
 
 1. 水平边界框可能不适合高度旋转的目标（如船只、飞机等）
 2. 评估指标仍使用 mAP，但计算方式基于水平框的 IoU
-3. 输出目录默认为 `/mnt/sdb/xuyun/PointOBB-v2/exps/exp1/cpm_hbox_dotav10/`
+3. 输出目录默认为 `/mnt/tmp/PointOBB-v2/exps/exp1/cpm_hbox_dotav10/`

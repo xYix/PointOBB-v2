@@ -128,3 +128,5 @@ mmrotate/.mim
 
 # dataset
 .data/
+*.md
+*.pdf
