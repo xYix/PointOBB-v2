@@ -130,3 +130,4 @@ mmrotate/.mim
 .data/
 *.md
 *.pdf
+vis_output/

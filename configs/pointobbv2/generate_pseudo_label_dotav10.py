@@ -3,7 +3,7 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-data_root = 'data/split_ss_dota_v10/'
+data_root = '/mnt/tmp/datasets/DOTAv10/split_ss_dota/'
 
 store_dir = 'rotated_fcos_r50_fpn_1x_dota_le90_9'
 
@@ -110,7 +110,7 @@ model = dict(
         cls_weight=1.0,
         thresh3=[0.03, 0.04, 0.1, 0.01, 0.10, 0.06, 0.08, 0.02, 0.01, 0.03, 0.005, 0.02, 0.05, 0.1, 0.015],
         pca_length=20,
-        store_ann_dir='your_pseudo_label_dir',
+        store_ann_dir='/mnt/tmp/datasets/DOTAv10pseudolabel/',
         multiple_factor=1/4
         ),
     test_cfg=dict(

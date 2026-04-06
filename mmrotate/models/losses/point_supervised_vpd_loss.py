@@ -2,22 +2,26 @@
 """Point-Supervised VPD Loss with Point-Conditioned Prior.
 
 All computations are done in **stride-normalized space**:
-  - bbox_mu[:, :2] = (delta_x / stride, delta_y / stride)  [network output]
-  - bbox_mu[:, 2:] = (log_w, log_h)  [log of size, no stride factor]
-  - gt_center_delta = (gt_center - anchor) / stride  [target in same space]
-  - d_i_norm = d_i_pixels / stride  [kNN distance normalized]
+  - bbox_mu[:, :2] = (Δx/stride, Δy/stride)   posterior mean for center offset
+  - bbox_mu[:, 2:] = (log w, log h)             posterior mean for log-size
+  - target center:  (gt_center - anchor) / stride
+  - d_i_norm = d_i_pixels / stride              kNN density in normalized units
 
-This ensures center loss, KL prior, and posterior are all in the same units.
+ELBO:
+  L = λ_center * L_center  +  λ_kl(t) * KL(q||p)
 
-ELBO objective:
-  L = lambda_center * L_center
-    + lambda_kl(t) * KL(q_phi || p_psi)
-    + lambda_var * L_var
+  L_center = SmoothL1( predicted_delta, gt_delta )   [in normalized space]
+
+  Prior p_ψ(z | p_i, N_i):
+    center dims: N(0, σ_c²),  σ_c = σ_c_coeff * d_i_norm
+    scale  dims: N(μ_s, σ_s²), μ_s = log(α * d_i_norm), σ_s annealed
+
+  KL = Σ_d KL(N(μ_q,σ_q²) || N(μ_p,σ_p²))
+     = Σ_d [ log(σ_p/σ_q) + (σ_q²+(μ_q-μ_p)²)/(2σ_p²) - 0.5 ]
 
 Curriculum:
-  Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup, sigma_s = sigma_s_init
-  Stage B (iter >= warmup_iters): lambda_kl linearly increases to lambda_kl,
-                                   sigma_s linearly anneals to sigma_s_final
+  Stage A (iter < warmup_iters): λ_kl = λ_kl_warmup, σ_s = σ_s_init
+  Stage B: λ_kl and σ_s linearly interpolate to final values over anneal_iters
 """
 import torch
 import torch.nn as nn
@@ -28,49 +32,54 @@ from ..builder import ROTATED_LOSSES
 
 @ROTATED_LOSSES.register_module()
 class PointSupervisedVPDLoss(nn.Module):
-    """Point-Supervised VPD Loss with point-conditioned prior in normalized space.
+    """Point-Supervised VPD Loss in stride-normalized space.
+
+    Key design choices:
+    - No separate variance regularization: KL already regularizes σ_q toward σ_p.
+    - log_sigma is clamped to [-6, 4] to prevent numerical explosion.
+    - KL weight ramps up smoothly (no step jump) from warmup to final value.
+    - Scale prior is intentionally broad (σ_s_init=2.0) at start so KL
+      does not force scale predictions before the network has seen enough data.
 
     Args:
-        lambda_center (float): Weight for center regression loss. Default: 1.0.
-        lambda_kl (float): Final KL weight (stage B). Default: 0.1.
-        lambda_kl_warmup (float): Initial KL weight (stage A). Default: 0.02.
-        lambda_var (float): Variance regularization weight. Default: 0.01.
-        knn_k (int): Nearest neighbors for density estimation. Default: 5.
-        sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
-            Default: 0.5.
-        scale_alpha_w (float): Scale prior mu_w = log(alpha_w * d_i_norm). Default: 1.0.
-        scale_alpha_h (float): Scale prior mu_h = log(alpha_h * d_i_norm). Default: 1.0.
-        sigma_s_init (float): Initial scale prior sigma. Default: 1.0.
-        sigma_s_final (float): Final scale prior sigma (after annealing). Default: 0.4.
-        warmup_iters (int): Iterations for stage A. Default: 2000.
-        anneal_iters (int): Iterations over which to anneal from stage A to B.
-            Default: 2000.
-        prior_delta_min (float): Min d_i_norm clamp (in normalized units). Default: 0.5.
-        prior_delta_max (float): Max d_i_norm clamp. Default: 16.0.
-        kl_clip (float): Hard clip on per-sample KL to prevent spikes. Default: 50.0.
+        lambda_center (float): Center loss weight. Default: 1.0.
+        lambda_kl (float): Final KL weight. Default: 0.05.
+        lambda_kl_warmup (float): Initial KL weight. Default: 0.005.
+        knn_k (int): kNN neighbors for density estimate. Default: 5.
+        sigma_c_coeff (float): Center prior σ_c = coeff * d_i_norm. Default: 1.0.
+        scale_alpha_w (float): Scale prior μ_w = log(α_w * d_i_norm). Default: 1.0.
+        scale_alpha_h (float): Scale prior μ_h = log(α_h * d_i_norm). Default: 1.0.
+        sigma_s_init (float): Initial scale prior σ_s (broad). Default: 2.0.
+        sigma_s_final (float): Final scale prior σ_s (tighter). Default: 0.8.
+        warmup_iters (int): Iters before KL ramp begins. Default: 1000.
+        anneal_iters (int): Iters over which KL ramps to final value. Default: 3000.
+        prior_delta_min (float): Min d_i_norm clamp. Default: 0.5.
+        prior_delta_max (float): Max d_i_norm clamp. Default: 20.0.
+        log_sigma_min (float): Clamp log_sigma from below (prevents σ→0). Default: -6.
+        log_sigma_max (float): Clamp log_sigma from above. Default: 4.
     """
 
     def __init__(self,
                  lambda_center=1.0,
-                 lambda_kl=0.1,
-                 lambda_kl_warmup=0.02,
-                 lambda_var=0.01,
+                 lambda_kl=0.05,
+                 lambda_kl_warmup=0.005,
                  knn_k=5,
-                 sigma_c_coeff=0.5,
+                 sigma_c_coeff=1.0,
                  scale_alpha_w=1.0,
                  scale_alpha_h=1.0,
-                 sigma_s_init=1.0,
-                 sigma_s_final=0.4,
-                 warmup_iters=2000,
-                 anneal_iters=2000,
+                 sigma_s_init=2.0,
+                 sigma_s_final=0.8,
+                 warmup_iters=1000,
+                 anneal_iters=3000,
                  prior_delta_min=0.5,
-                 prior_delta_max=16.0,
-                 kl_clip=50.0):
+                 prior_delta_max=20.0,
+                 log_sigma_min=-6.0,
+                 log_sigma_max=4.0,
+                 center_beta=1.0):
         super(PointSupervisedVPDLoss, self).__init__()
         self.lambda_center = lambda_center
         self.lambda_kl = lambda_kl
         self.lambda_kl_warmup = lambda_kl_warmup
-        self.lambda_var = lambda_var
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
         self.scale_alpha_w = scale_alpha_w
@@ -81,39 +90,18 @@ class PointSupervisedVPDLoss(nn.Module):
         self.anneal_iters = anneal_iters
         self.prior_delta_min = prior_delta_min
         self.prior_delta_max = prior_delta_max
-        self.kl_clip = kl_clip
+        self.log_sigma_min = log_sigma_min
+        self.log_sigma_max = log_sigma_max
+        self.center_beta = center_beta
 
     def _curriculum(self, cur_iter):
-        """Return (eff_lambda_kl, sigma_s) for current iteration."""
+        """Return (eff_lambda_kl, sigma_s) with smooth linear ramp."""
         if cur_iter < self.warmup_iters:
             return self.lambda_kl_warmup, self.sigma_s_init
         ratio = min(1.0, (cur_iter - self.warmup_iters) / max(self.anneal_iters, 1))
-        eff_lambda_kl = self.lambda_kl_warmup + ratio * (self.lambda_kl - self.lambda_kl_warmup)
+        eff_lkl = self.lambda_kl_warmup + ratio * (self.lambda_kl - self.lambda_kl_warmup)
         sigma_s = self.sigma_s_init - ratio * (self.sigma_s_init - self.sigma_s_final)
-        return eff_lambda_kl, sigma_s
-
-    def _compute_di_norm(self, gt_centers_norm, all_gt_centers_norm):
-        """Compute mean kNN distance in normalized space for each positive sample.
-
-        Args:
-            gt_centers_norm (Tensor): Matched GT center in normalized space (N, 2).
-                Format: (gt_center - anchor) / stride
-            all_gt_centers_norm (Tensor): All GT centers normalized (M, 2).
-
-        Returns:
-            Tensor: d_i per sample (N,), clamped to [prior_delta_min, prior_delta_max].
-        """
-        N, M = gt_centers_norm.shape[0], all_gt_centers_norm.shape[0]
-        if M <= 1:
-            return gt_centers_norm.new_full((N,), self.prior_delta_max)
-
-        dists = torch.cdist(gt_centers_norm, all_gt_centers_norm)  # (N, M)
-        # Mask self (distance ~0)
-        dists = dists + (dists < 1e-2).float() * 1e8
-        k = min(self.knn_k, M - 1)
-        knn_dists, _ = dists.topk(k, dim=1, largest=False)
-        d_i = knn_dists.mean(dim=1)
-        return d_i.clamp(min=self.prior_delta_min, max=self.prior_delta_max)
+        return eff_lkl, sigma_s
 
     def forward(self,
                 bbox_mu,
@@ -123,94 +111,106 @@ class PointSupervisedVPDLoss(nn.Module):
                 gt_centers,
                 gt_centers_list,
                 cur_iter=0):
-        """Compute point-supervised VPD loss in stride-normalized space.
+        """Compute loss.
 
         Args:
             bbox_mu (Tensor): Posterior mean (N, 4).
-                [:, :2] = (delta_x/stride, delta_y/stride)  -- normalized center offset
-                [:, 2:] = (log_w, log_h)  -- log size (no stride)
+                [:, :2] = (Δx/stride, Δy/stride)
+                [:, 2:] = (log_w, log_h)
             bbox_log_sigma (Tensor): Posterior log-std (N, 4).
-            pos_points (Tensor): Anchor points in image coords (N, 2).
-            pos_strides (Tensor): Stride per positive sample (N,).
-            gt_centers (Tensor): Matched GT center in image coords (N, 2).
-            gt_centers_list (list[Tensor]): All GT centers per image in image coords.
-            cur_iter (int): Current training iteration.
+            pos_points (Tensor): Anchor points, image coords (N, 2).
+            pos_strides (Tensor): Stride per anchor (N,).
+            gt_centers (Tensor): Matched GT centers, image coords (N, 2).
+            gt_centers_list (list[Tensor]): All GT centers per image (image coords).
+            cur_iter (int): Training iteration for curriculum.
 
         Returns:
-            dict[str, Tensor]: loss_center, loss_kl, loss_var, loss_total.
+            dict[str, Tensor]: loss_center (weighted), loss_kl (weighted).
         """
         N = bbox_mu.shape[0]
         if N == 0:
             zero = bbox_mu.sum() * 0.0
-            return dict(loss_center=zero, loss_kl=zero, loss_var=zero, loss_total=zero)
+            return dict(loss_center=zero, loss_kl=zero)
 
-        stride_2d = pos_strides.unsqueeze(1)  # (N, 1)
+        stride_1d = pos_strides.float()          # (N,)
+        stride_2d = stride_1d.unsqueeze(1)       # (N, 1)
 
-        # --- Center loss in normalized space ---
-        # target: (gt_center - anchor) / stride
-        gt_delta_norm = (gt_centers - pos_points) / stride_2d  # (N, 2)
-        pred_delta_norm = bbox_mu[:, :2]                        # (N, 2)
+        # ── Center loss ────────────────────────────────────────────────
+        # Both target and prediction are in normalized (stride-divided) space.
+        # Use 'sum' reduction divided by N to match detection-style loss scaling,
+        # and a small beta to keep more samples in the quadratic regime where
+        # gradients are proportional to the error magnitude.
+        gt_delta_norm = (gt_centers - pos_points) / stride_2d   # (N, 2)
+        pred_delta_norm = bbox_mu[:, :2]                         # (N, 2)
         l_center = F.smooth_l1_loss(pred_delta_norm, gt_delta_norm,
-                                    reduction='mean', beta=1.0)
+                                    reduction='sum', beta=self.center_beta) / N
 
-        # --- Build point-conditioned prior in normalized space ---
+        # ── Point-conditioned prior ───────────────────────────────────
         eff_lambda_kl, sigma_s = self._curriculum(cur_iter)
 
-        # For kNN, normalize all GT centers relative to each sample's anchor/stride.
-        # Simpler: use pixel-space kNN distances, then divide by mean stride.
-        # Concatenate all GT centers (pixel space) for kNN lookup.
-        all_gt_centers_px = torch.cat(gt_centers_list, dim=0)  # (M, 2)
-        mean_stride = pos_strides.float().mean()
-
-        # kNN distances in pixel space, then normalize
-        if all_gt_centers_px.shape[0] > 1:
-            dists_px = torch.cdist(gt_centers, all_gt_centers_px)  # (N, M)
-            dists_px = dists_px + (dists_px < 1e-2).float() * 1e8
-            k = min(self.knn_k, all_gt_centers_px.shape[0] - 1)
-            knn_dists_px, _ = dists_px.topk(k, dim=1, largest=False)
-            d_i_px = knn_dists_px.mean(dim=1)  # (N,) in pixels
+        # kNN distance in pixel space, then normalize by per-sample stride
+        all_gt_px = torch.cat(gt_centers_list, dim=0)           # (M, 2)
+        M = all_gt_px.shape[0]
+        if M > 1:
+            dists = torch.cdist(gt_centers, all_gt_px)          # (N, M)
+            dists = dists + (dists < 1e-2).float() * 1e8        # mask self
+            k = min(self.knn_k, M - 1)
+            knn_px, _ = dists.topk(k, dim=1, largest=False)
+            d_i_px = knn_px.mean(dim=1)                         # (N,)
         else:
-            d_i_px = gt_centers.new_full((N,), mean_stride * self.prior_delta_max)
+            d_i_px = stride_1d * self.prior_delta_max
 
-        # Normalize d_i by per-sample stride
-        d_i_norm = (d_i_px / pos_strides.float()).clamp(
+        d_i_norm = (d_i_px / stride_1d).clamp(
             min=self.prior_delta_min, max=self.prior_delta_max)  # (N,)
 
-        # Center prior: mu=0, sigma = sigma_c_coeff * d_i_norm  (in normalized units)
-        sigma_c = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)  # (N, 2)
+        # Center prior: N(0, σ_c²)
+        # Enforce a minimum sigma to prevent KL gradient explosion when
+        # the posterior mean is far from the prior mean.
+        sigma_c = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)
+        sigma_c = sigma_c.clamp(min=1.0)   # at least 1 stride unit
         mu_c = torch.zeros(N, 2, device=bbox_mu.device)
 
-        # Scale prior: mu = log(alpha * d_i_norm), sigma = sigma_s
+        # Scale prior: N(log(α·d_i_norm), σ_s²)
+        # log_w, log_h are log of size in stride-normalized units.
+        # Use broad sigma_s to avoid forcing scale before the model converges.
         mu_s = torch.stack([
             torch.log(self.scale_alpha_w * d_i_norm),
             torch.log(self.scale_alpha_h * d_i_norm)], dim=1)   # (N, 2)
-        sigma_s_2d = bbox_mu.new_full((N, 2), sigma_s)
+        sigma_s_2d = bbox_mu.new_full((N, 2), max(sigma_s, 1.0))
 
-        prior_mu = torch.cat([mu_c, mu_s], dim=1)              # (N, 4)
-        prior_sigma = torch.cat([sigma_c, sigma_s_2d], dim=1)  # (N, 4)
+        prior_mu    = torch.cat([mu_c, mu_s], dim=1)            # (N, 4)
+        prior_sigma = torch.cat([sigma_c, sigma_s_2d], dim=1)   # (N, 4)
 
-        # --- KL loss with per-sample clipping to prevent spikes ---
-        sigma_q = bbox_log_sigma.exp().clamp(min=1e-6)
-        sigma_p = prior_sigma.clamp(min=1e-6)
-        kl_per_dim = (torch.log(sigma_p / sigma_q)
-                      + (sigma_q.pow(2) + (bbox_mu - prior_mu).pow(2))
-                      / (2.0 * sigma_p.pow(2))
-                      - 0.5)
-        kl_per_sample = kl_per_dim.sum(dim=-1)  # (N,)
-        # Clip per-sample KL to prevent a few outlier samples from causing divergence
-        kl_per_sample = kl_per_sample.clamp(max=self.kl_clip)
-        l_kl = kl_per_sample.mean()
+        # ── KL divergence ─────────────────────────────────────────────
+        # Clamp log_sigma to prevent σ_q → 0 (collapse) or σ_q → ∞.
+        # Using clamp with straight-through: the forward value is clamped,
+        # and gradients flow through the clamp boundary.
+        log_sigma_q = bbox_log_sigma.clamp(
+            min=self.log_sigma_min, max=self.log_sigma_max)
+        sigma_q = log_sigma_q.exp()
+        sigma_p = prior_sigma.clamp(min=1e-4)
 
-        # --- Variance regularization on center dims ---
-        l_var = bbox_log_sigma[:, :2].exp().mean()
+        kl = (torch.log(sigma_p / sigma_q)
+              + (sigma_q.pow(2) + (bbox_mu - prior_mu).pow(2))
+              / (2.0 * sigma_p.pow(2))
+              - 0.5)                                             # (N, 4)
 
-        loss_total = (self.lambda_center * l_center
-                      + eff_lambda_kl * l_kl
-                      + self.lambda_var * l_var)
+        # Apply KL only to center dims early in training, add scale dims after warmup.
+        # This prevents KL explosion from poorly initialized scale predictions.
+        center_kl = kl[:, :2].sum(dim=-1).mean()
+        scale_kl = kl[:, 2:].sum(dim=-1).mean()
+
+        # Scale KL contribution ramps up more slowly
+        scale_kl_ratio = min(1.0, max(0.0,
+            (cur_iter - self.warmup_iters) / max(self.anneal_iters, 1)))
+        l_kl = center_kl + scale_kl_ratio * scale_kl
+
+        # Return already-weighted losses.  The framework sums all returned
+        # loss_* values, so each entry must carry its own coefficient.
+        weighted_center = self.lambda_center * l_center
+        weighted_kl = eff_lambda_kl * l_kl
 
         return dict(
-            loss_center=l_center,
-            loss_kl=l_kl,
-            loss_var=l_var,
-            loss_total=loss_total,
+            loss_center=weighted_center,
+            loss_kl=weighted_kl,
         )

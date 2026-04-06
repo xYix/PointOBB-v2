@@ -431,7 +431,8 @@ class PseudoLabelHead(RotatedFCOSHead):
         gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1) # [num_gts, pca_length^2]
         points_rect_xy_adapt = points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1) * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1) # [num_gts, pca_length^2, 2] 
         points_cov_matrix = torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt) / (gt_ctr_rect_label.shape[-1] ** 2 - 1) # [num_gts, 2, 2]
-        eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
+        # eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
+        eigvals, eigvecs = torch.linalg.eigh(points_cov_matrix, UPLO='L')
         
         # get the largest eigval and the corresponding eigvec
         larger_eigvals_index = (eigvals[:, 1] > eigvals[:, 0]).int()

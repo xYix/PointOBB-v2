@@ -9,6 +9,7 @@ MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python -m torch.distributed.launch \
+    --use-env \
     --nnodes=$NNODES \
     --node_rank=$NODE_RANK \
     --master_addr=$MASTER_ADDR \
@@ -17,4 +18,4 @@ python -m torch.distributed.launch \
     $(dirname "$0")/train.py \
     $CONFIG \
     --seed 0 \
-    --launcher pytorch ${@:3}
+    --launcher pytorch ${@:3} 

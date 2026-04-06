@@ -61,11 +61,11 @@ class CPMVPDHead(CPMHead):
 
         self.loss_vpd = build_loss(dict(
             type='PointSupervisedVPDLoss',
-            lambda_center=1.0,
-            lambda_kl=0.1,
-            lambda_kl_warmup=0.02,
-            lambda_var=0.01,
+            lambda_center=10.0,
+            lambda_kl=0.05,
+            lambda_kl_warmup=0.005,
             warmup_iters=self.warmup_iters,
+            center_beta=0.5,
         ))
 
     def _init_predictor(self):
@@ -279,8 +279,7 @@ class CPMVPDHead(CPMHead):
         # VPD loss on positive samples
         if len(pos_inds) == 0:
             zero = flatten_bbox_preds.sum() * 0.0
-            return dict(loss_cls=loss_cls,
-                        loss_center=zero, loss_kl=zero, loss_var=zero)
+            return dict(loss_cls=loss_cls, loss_center=zero, loss_kl=zero)
 
         pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 8)
         pos_points = flatten_points[pos_inds]           # (Np, 2)
@@ -319,7 +318,6 @@ class CPMVPDHead(CPMHead):
             loss_cls=loss_cls,
             loss_center=vpd_losses['loss_center'],
             loss_kl=vpd_losses['loss_kl'],
-            loss_var=vpd_losses['loss_var'],
         )
 
     # ------------------------------------------------------------------
@@ -358,6 +356,7 @@ class CPMVPDHead(CPMHead):
     def get_bboxes(self, cls_scores, bbox_preds, centernesses,
                    img_metas, cfg=None, rescale=None):
         """Inference: decode posterior mean, apply NMS."""
+        cfg = cfg or self.test_cfg
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         num_levels = len(cls_scores)
 
