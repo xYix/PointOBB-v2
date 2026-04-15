@@ -5,7 +5,7 @@ _base_ = [
 
 data_root = '/mnt/tmp/datasets/DOTAv10/split_ss_dota/'
 
-store_dir = '/mnt/tmp/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+store_dir = '/mnt/tmp/PointOBB-v2/exps/exp1/stride4/'
 
 angle_version = 'le90'
 
@@ -100,7 +100,7 @@ model = dict(
             type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
     # training and testing settings
     train_cfg=dict(
-        visualize=False,
+        visualize=True,
         store_dir=store_dir,
         cls_weight=20,              # Classification loss weight
         thresh1=8,                  # Positive sample threshold

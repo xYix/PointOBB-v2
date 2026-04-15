@@ -106,7 +106,7 @@ model = dict(
             type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
     # training and testing settings
     train_cfg=dict(
-        visualize=False,
+        visualize=True,
         store_dir=store_dir,
         cls_weight=1.0,
         thresh1=6,
@@ -128,5 +128,5 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     step=[4])
-evaluation = dict(interval=6, metric='mAP')
+evaluation = dict(interval=999, metric='mAP')  # skip eval, no meaningful result
 optimizer = dict(lr=0.05)

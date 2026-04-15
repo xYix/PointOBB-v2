@@ -12,7 +12,7 @@ Examples:
     python tools/visualize.py loss work_dirs/vpd_dotav10/20260401_234142.log.json
 
     # Compare two runs
-    python tools/visualize.py loss run1.log.json run2.log.json --keys loss_center loss_kl
+    python tools/visualize.py loss run1.log.json run2.log.json --keys loss_mu_dense loss_sigma_dense
 
     # Visualize detections
     python tools/visualize.py detect \
@@ -118,7 +118,7 @@ def _forward_features(model, data, device):
 
     Returns:
         cls_scores: list[Tensor], each (1, C, H, W) — raw logits
-        bbox_preds: list[Tensor], each (1, 8, H, W) for VPD / (1, 4, H, W) for CPM
+        bbox_preds: list[Tensor], each (1, 4, H, W) — [mu_dx, mu_dy, log_sigma_dx, log_sigma_dy]
         centernesses: list[Tensor], each (1, 1, H, W)
     """
     with torch.no_grad():
@@ -323,30 +323,41 @@ def cmd_detect(args):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Subcommand: cpm  —  Per-class classification probability heatmap
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Subcommand: cpm  —  CPM classification score heatmap
+#  Style: matches cpm_head.draw_image — PIL-based, image|mask side-by-side
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CPM_PALETTE = [
+    (165, 42, 42), (189, 183, 107), (0, 255, 0), (255, 0, 0),
+    (138, 43, 226), (255, 128, 0), (255, 0, 255), (0, 255, 255),
+    (255, 193, 193), (0, 51, 153), (255, 250, 205), (0, 139, 139),
+    (0, 0, 255), (147, 116, 116), (0, 0, 255),
+]
+
+
+def _get_cls_mask(max_probs, max_indices, thr, H, W):
+    """Build class-colored mask: pixel = class color if prob > thr, else transparent (black with alpha=0)."""
+    mask = np.zeros((H, W, 3), dtype=np.uint8)
+    alpha = np.zeros((H, W), dtype=np.float32)
+    above = max_probs > thr
+    for i in range(H):
+        for j in range(W):
+            if above[i, j]:
+                mask[i, j] = CPM_PALETTE[int(max_indices[i, j]) % len(CPM_PALETTE)]
+                alpha[i, j] = min(float(max_probs[i, j]), 1.0)
+    return mask, alpha
+
 
 def cmd_cpm(args):
+    from PIL import Image
+
     model, cfg = _build_model(args.config, args.checkpoint, args.device)
     img_names, img_prefix = _resolve_images(cfg, args.images,
                                             args.num_images, args.seed)
     ann_dir = cfg.data.train.ann_file
     levels = args.levels
+    thresholds = args.thresholds
     os.makedirs(args.output_dir, exist_ok=True)
-
-    # Resolve which classes to show
-    num_classes = len(CLASSES)
-    if args.classes:
-        show_cls = []
-        for c in args.classes:
-            if c.isdigit():
-                show_cls.append(int(c))
-            elif c in CLASSES:
-                show_cls.append(CLASSES.index(c))
-            else:
-                print(f'[WARN] Unknown class: {c}')
-        if not show_cls:
-            show_cls = list(range(num_classes))
-    else:
-        show_cls = list(range(num_classes))
 
     for img_name in img_names:
         img_path = os.path.join(img_prefix, img_name)
@@ -354,9 +365,6 @@ def cmd_cpm(args):
             print(f'[WARN] Image not found: {img_path}')
             continue
 
-        img_bgr = cv2.imread(img_path)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_h, img_w = img_bgr.shape[:2]
         data = _prepare_input(model, img_path, args.device)
         outs = _forward_features(model, data, args.device)
         cls_scores = outs[0]  # list[Tensor(1, C, H, W)]
@@ -365,84 +373,54 @@ def cmd_cpm(args):
         num_levels = len(cls_scores)
         use_levels = levels if levels else list(range(num_levels))
 
-        # Load GT for annotating which classes are present
-        gt_boxes = load_gt_annotations(ann_dir, img_name)
-        gt_cls_set = set()
-        gt_centers = []  # (cx, cy, cls_id)
-        for coords, cls_name in gt_boxes:
-            cls_id = CLASSES.index(cls_name) if cls_name in CLASSES else -1
-            gt_cls_set.add(cls_id)
-            pts = np.array(coords).reshape(4, 2)
-            cx, cy = pts.mean(axis=0)
-            gt_centers.append((cx, cy, cls_id))
-
         for lvl in use_levels:
             if lvl >= num_levels:
                 continue
-            cls_score = cls_scores[lvl][0]  # (C, H, W)
-            probs = cls_score.sigmoid().cpu().numpy()  # (C, H, W)
-            H, W = probs.shape[1:]
+            score_probs = cls_scores[lvl][0].sigmoid()  # (C, H, W)
+            H, W = score_probs.shape[1:]
             stride = model.bbox_head.strides[lvl]
 
-            n_show = len(show_cls)
-            ncols = min(n_show + 1, 6)  # +1 for max-prob panel
-            nrows = (n_show + 1 + ncols - 1) // ncols
-            fig, axes = plt.subplots(nrows, ncols,
-                                     figsize=(4 * ncols, 4 * nrows),
-                                     squeeze=False)
+            max_probs, max_indices = score_probs.max(dim=0)  # (H, W)
+            max_probs = max_probs.cpu().numpy()
+            max_indices = max_indices.cpu().numpy()
 
-            img_small = cv2.resize(img_rgb, (W, H),
-                                   interpolation=cv2.INTER_AREA)
+            img_pil = Image.open(img_path).convert('RGB')
+            img_small = img_pil.resize((W, H))
 
-            # Panel 0: max class probability
-            ax = axes.flat[0]
-            max_prob = probs[show_cls].max(axis=0)  # (H, W)
-            ax.imshow(img_small, alpha=0.3)
-            im = ax.imshow(max_prob, cmap='hot', alpha=0.7, vmin=0,
-                           vmax=max(0.3, float(max_prob.max())))
-            ax.set_title('max prob', fontsize=9, fontweight='bold')
-            ax.axis('off')
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            # Draw GT centers
-            for cx, cy, cid in gt_centers:
-                fx, fy = cx / img_w * W, cy / img_h * H
-                ax.plot(fx, fy, 'g+', markersize=6, markeredgewidth=1.5)
+            out_dir = os.path.join(args.output_dir,
+                                   f'{stem}_L{lvl}_s{stride}')
+            os.makedirs(out_dir, exist_ok=True)
 
-            # Per-class panels
-            for idx, cls_id in enumerate(show_cls):
-                ax = axes.flat[idx + 1]
-                prob_hw = probs[cls_id]  # (H, W)
-                ax.imshow(img_small, alpha=0.3)
-                vmax = max(0.1, float(np.percentile(prob_hw, 99.5)))
-                im = ax.imshow(prob_hw, cmap='hot', alpha=0.7,
-                               vmin=0, vmax=vmax)
-                title = CLASSES[cls_id] if cls_id < len(CLASSES) else str(cls_id)
-                # Mark title green if this class has GT in this image
-                color = 'green' if cls_id in gt_cls_set else 'black'
-                ax.set_title(title, fontsize=8, color=color, fontweight='bold')
-                ax.axis('off')
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                # Draw GT centers of this class
-                for cx, cy, cid in gt_centers:
-                    if cid == cls_id:
-                        fx, fy = cx / img_w * W, cy / img_h * H
-                        ax.plot(fx, fy, 'g+', markersize=6,
-                                markeredgewidth=1.5)
+            for thr in thresholds:
+                mask, alpha = _get_cls_mask(max_probs, max_indices, thr, H, W)
+                # Blend: overlay class mask on image, alpha modulated by prob
+                img_np = np.array(img_small).astype(np.float32)
+                mask_f = mask.astype(np.float32)
+                a = (alpha * 0.6)[..., None]  # overlay strength
+                blended = img_np * (1.0 - a) + mask_f * a
+                blended = blended.astype(np.uint8)
+                Image.fromarray(blended).save(
+                    os.path.join(out_dir, f'{thr}.jpg'))
 
-            # Hide unused panels
-            for idx in range(n_show + 1, nrows * ncols):
-                axes.flat[idx].axis('off')
+            # --- Per-class probability heatmaps ---
+            probs_np = score_probs.cpu().numpy()  # (C, H, W)
+            img_small_np = np.array(img_small)    # (H, W, 3) RGB
 
-            fig.suptitle(f'{stem}  Level {lvl} (stride={stride}, {H}x{W})',
-                         fontsize=12)
-            fig.tight_layout()
-            out_path = os.path.join(args.output_dir,
-                                    f'{stem}_cpm_L{lvl}.png')
-            fig.savefig(out_path, dpi=150)
-            plt.close(fig)
+            for cls_id in range(probs_np.shape[0]):
+                prob_hw = probs_np[cls_id]    # (H, W)
+                pmax = max(prob_hw.max(), 1e-6)
+                # Normalize to [0, 255] and apply JET colormap
+                norm = (np.clip(prob_hw / pmax, 0, 1) * 255).astype(np.uint8)
+                heatmap = cv2.applyColorMap(norm, cv2.COLORMAP_JET)  # BGR
+                heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+                # Blend: 40% image + 60% heatmap
+                blended = (img_small_np * 0.4 + heatmap_rgb * 0.6).astype(np.uint8)
+                cls_name = CLASSES[cls_id] if cls_id < len(CLASSES) else str(cls_id)
+                out_img = Image.fromarray(blended)
+                out_img.save(os.path.join(out_dir, f'cls_{cls_name}.jpg'))
 
-        print(f'[cpm] {stem}: {len(use_levels)} levels, '
-              f'{len(show_cls)} classes')
+        print(f'[cpm] {stem}: {len(use_levels)} levels x '
+              f'{len(thresholds)} thrs + {probs_np.shape[0]} class maps')
 
     print(f'\nDone. Results saved to {args.output_dir}/')
 
@@ -459,10 +437,10 @@ def cmd_varmap(args):
     levels = args.levels
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Verify this is a VPD head (8-channel bbox_pred)
-    is_vpd = hasattr(model.bbox_head, 'loss_vpd')
+    # Verify this is a VPD head (has conv_sigma)
+    is_vpd = hasattr(model.bbox_head, 'conv_sigma')
     if not is_vpd:
-        print('[ERROR] varmap requires a CPMVPDHead (8-ch bbox_pred).')
+        print('[ERROR] varmap requires a CPMVPDHead (conv_sigma).')
         sys.exit(1)
 
     for img_name in img_names:
@@ -472,50 +450,49 @@ def cmd_varmap(args):
             continue
 
         img_bgr = cv2.imread(img_path)
-        img_h, img_w = img_bgr.shape[:2]
         data = _prepare_input(model, img_path, args.device)
         outs = _forward_features(model, data, args.device)
 
         cls_scores = outs[0]   # list[(1, C, H, W)]
-        bbox_preds = outs[1]   # list[(1, 8, H, W)]
+        bbox_preds = outs[1]   # list[(1, 4, H, W)]
         num_levels = len(bbox_preds)
         use_levels = levels if levels else list(range(num_levels))
 
         stem = Path(img_name).stem
 
-        # Channel semantics for VPD:
-        #   bbox_pred[:, 0:4] = mu  (delta_x, delta_y, log_w, log_h)
-        #   bbox_pred[:, 4:8] = log_sigma (log_sx, log_sy, log_sw, log_sh)
-        channel_names = ['sigma_dx', 'sigma_dy', 'sigma_w', 'sigma_h']
-        mu_names = ['mu_dx', 'mu_dy', 'mu_logw', 'mu_logh']
+        # Channel semantics (4-ch, center-only, no w/h):
+        #   bbox_pred[:, 0:2] = mu  (delta_x, delta_y)
+        #   bbox_pred[:, 2:4] = log_sigma (log_sx, log_sy)
 
         for lvl in use_levels:
             if lvl >= num_levels:
                 continue
-            bp = bbox_preds[lvl][0]     # (8, H, W)
+            bp = bbox_preds[lvl][0]     # (4, H, W)
             cs = cls_scores[lvl][0]     # (C, H, W)
             H, W = bp.shape[1:]
             stride = model.bbox_head.strides[lvl]
 
-            log_sigma = bp[4:8].cpu().numpy()   # (4, H, W)
-            sigma = np.exp(log_sigma)           # (4, H, W)
-            mu = bp[0:4].cpu().numpy()          # (4, H, W)
+            mu = bp[0:2].cpu().numpy()              # (2, H, W)
+            log_sigma = bp[2:4].cpu().numpy()       # (2, H, W)
+            sigma = np.exp(log_sigma)               # (2, H, W)
             max_prob = cs.sigmoid().max(dim=0)[0].cpu().numpy()  # (H, W)
 
-            # --- Figure: 2 rows x 4 cols ---
-            # Row 1: mu channels (delta_x, delta_y, log_w, log_h)
-            # Row 2: sigma channels (uncertainty)
-            # + 1 col for cls_score + 1 col for total uncertainty
-            fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+            mu_names = ['mu_dx', 'mu_dy']
+            sigma_names = ['sigma_dx', 'sigma_dy']
+
+            # --- Figure: 2 rows x 3 cols ---
+            # Row 0: mu_dx, mu_dy, max_cls_prob
+            # Row 1: sigma_dx, sigma_dy, center_uncertainty
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
             fig.suptitle(f'{stem}  Level {lvl} (stride={stride}, {H}x{W})',
                          fontsize=14)
 
             img_small = cv2.resize(img_bgr, (W, H),
                                    interpolation=cv2.INTER_AREA)
             img_small_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB)
-
+            
             # Row 0: mu channels
-            for ch in range(4):
+            for ch in range(2):
                 ax = axes[0, ch]
                 ax.imshow(img_small_rgb, alpha=0.3)
                 im = ax.imshow(mu[ch], cmap='RdBu_r', alpha=0.7,
@@ -525,8 +502,8 @@ def cmd_varmap(args):
                 ax.axis('off')
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            # Row 0, col 4: cls_score heatmap
-            ax = axes[0, 4]
+            # Row 0, col 2: cls_score heatmap
+            ax = axes[0, 2]
             ax.imshow(img_small_rgb, alpha=0.3)
             im = ax.imshow(max_prob, cmap='hot', alpha=0.7, vmin=0, vmax=1)
             ax.set_title('max cls_prob', fontsize=10)
@@ -534,24 +511,26 @@ def cmd_varmap(args):
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
             # Row 1: sigma channels
-            for ch in range(4):
+            for ch in range(2):
                 ax = axes[1, ch]
                 ax.imshow(img_small_rgb, alpha=0.3)
-                im = ax.imshow(sigma[ch], cmap='magma', alpha=0.7,
+                # im = ax.imshow(sigma[ch], cmap='magma', alpha=0.7,
+                im = ax.imshow(sigma[ch], cmap='RdBu_r', alpha=0.7,
                                vmin=np.percentile(sigma[ch], 2),
                                vmax=np.percentile(sigma[ch], 98))
-                ax.set_title(channel_names[ch], fontsize=10)
+                ax.set_title(sigma_names[ch], fontsize=10)
                 ax.axis('off')
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            # Row 1, col 4: total uncertainty = mean(sigma across 4 dims)
-            ax = axes[1, 4]
-            total_unc = sigma.mean(axis=0)  # (H, W)
+            # Row 1, col 2: center uncertainty = sqrt(sigma_dx^2 + sigma_dy^2)
+            ax = axes[1, 2]
+            center_unc = np.sqrt(sigma[0] ** 2 + sigma[1] ** 2)
             ax.imshow(img_small_rgb, alpha=0.3)
-            im = ax.imshow(total_unc, cmap='magma', alpha=0.7,
-                           vmin=np.percentile(total_unc, 2),
-                           vmax=np.percentile(total_unc, 98))
-            ax.set_title('total uncertainty', fontsize=10)
+            # im = ax.imshow(center_unc, cmap='magma', alpha=0.7,
+            im = ax.imshow(center_unc, cmap='RdBu_r', alpha=0.7,
+                           vmin=np.percentile(center_unc, 2),
+                           vmax=np.percentile(center_unc, 98))
+            ax.set_title('center uncertainty', fontsize=10)
             ax.axis('off')
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -561,11 +540,25 @@ def cmd_varmap(args):
             fig.savefig(out_path, dpi=150)
             plt.close(fig)
 
+            # --- Clean center uncertainty heatmap (no background) ---
+            fig_clean, ax_clean = plt.subplots(1, 1, figsize=(8, 8))
+            im_clean = ax_clean.imshow(center_unc, cmap='jet',
+                                       vmin=np.percentile(center_unc, 2),
+                                       vmax=max(np.percentile(center_unc, 98),
+                                                np.percentile(center_unc, 2) + 1e-6))
+            ax_clean.axis('off')
+            plt.colorbar(im_clean, ax=ax_clean, fraction=0.046, pad=0.04)
+            fig_clean.tight_layout()
+            clean_path = os.path.join(args.output_dir,
+                                      f'{stem}_center_unc_clean_L{lvl}.png')
+            fig_clean.savefig(clean_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_clean)
+
             # --- Also save a single clean overlay for quick viewing ---
-            # center uncertainty = sqrt(sigma_dx^2 + sigma_dy^2)
-            center_unc = np.sqrt(sigma[0] ** 2 + sigma[1] ** 2)
+            # overlay = _overlay_heatmap(img_bgr, center_unc,
+            #                            colormap=cv2.COLORMAP_MAGMA, alpha=0.5)
             overlay = _overlay_heatmap(img_bgr, center_unc,
-                                       colormap=cv2.COLORMAP_MAGMA, alpha=0.5)
+                                       colormap=cv2.COLORMAP_JET, alpha=0.5)
             cv2.putText(overlay,
                         f'Center uncertainty  L{lvl} (stride={stride})',
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -604,6 +597,70 @@ def _add_common_model_args(parser):
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Subcommand: gtvis  —  GT annotation visualization (OBB + center point)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cmd_gtvis(args):
+    """Draw GT oriented bounding boxes and center points on images."""
+    from mmcv import Config
+
+    cfg = Config.fromfile(args.config)
+    img_prefix = cfg.data.train.img_prefix
+    ann_dir = cfg.data.train.ann_file
+
+    if args.images:
+        img_names = args.images
+    else:
+        import random
+        random.seed(args.seed)
+        all_imgs = sorted(os.listdir(img_prefix))
+        img_names = random.sample(all_imgs,
+                                  min(args.num_images, len(all_imgs)))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    for img_name in img_names:
+        img_path = os.path.join(img_prefix, img_name)
+        if not os.path.isfile(img_path):
+            print(f'[WARN] Image not found: {img_path}')
+            continue
+
+        img = cv2.imread(img_path)
+        gt_boxes = load_gt_annotations(ann_dir, img_name)
+
+        cls_to_color = {}
+        for coords, cls_name in gt_boxes:
+            if cls_name not in cls_to_color:
+                idx = CLASSES.index(cls_name) if cls_name in CLASSES else len(cls_to_color)
+                cls_to_color[cls_name] = PALETTE[idx % len(PALETTE)]
+
+            color = cls_to_color[cls_name]
+            pts = np.array(coords, dtype=np.float32).reshape(4, 2)
+
+            # Draw OBB
+            pts_int = pts.astype(np.int32)
+            cv2.polylines(img, [pts_int], isClosed=True,
+                          color=color, thickness=2)
+
+            # Draw center point
+            cx, cy = pts.mean(axis=0).astype(int)
+            cv2.circle(img, (cx, cy), 4, color, -1)
+
+        # Legend
+        y0 = 20
+        for cls_name, color in cls_to_color.items():
+            cv2.putText(img, cls_name, (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            y0 += 18
+
+        stem = Path(img_name).stem
+        out_path = os.path.join(args.output_dir, f'{stem}_gt.jpg')
+        cv2.imwrite(out_path, img)
+
+    print(f'[gtvis] {len(img_names)} images → {args.output_dir}/')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='PointOBB-v2 VPD Visualization Tools',
@@ -615,7 +672,8 @@ def main():
     p_loss = sub.add_parser('loss', help='Plot training loss curves')
     p_loss.add_argument('log_files', nargs='+', help='log.json file(s)')
     p_loss.add_argument('--keys', nargs='+',
-                        default=['loss_center', 'loss_kl', 'loss', 'grad_norm'],
+                        default=['loss_mu_dense', 'loss_sigma_dense',
+                                 'loss_cls', 'loss', 'grad_norm'],
                         help='Loss keys to plot')
     p_loss.add_argument('--smooth', type=float, default=0.9,
                         help='EMA smoothing factor (0=none, 0.9=default)')
@@ -630,12 +688,13 @@ def main():
 
     # --- cpm ---
     p_cpm = sub.add_parser('cpm',
-                           help='Per-class classification probability heatmap')
+                           help='CPM classification score heatmap')
     _add_common_model_args(p_cpm)
     p_cpm.add_argument('--levels', type=int, nargs='*', default=None,
                        help='FPN levels to visualize (default: all)')
-    p_cpm.add_argument('--classes', nargs='*', default=None,
-                       help='Classes to show (name or index, default: all)')
+    p_cpm.add_argument('--thresholds', type=float, nargs='+',
+                       default=[0.01, 0.03, 0.05, 0.08, 0.1, 0.15],
+                       help='Score thresholds for class mask')
 
     # --- varmap ---
     p_var = sub.add_parser('varmap',
@@ -643,6 +702,18 @@ def main():
     _add_common_model_args(p_var)
     p_var.add_argument('--levels', type=int, nargs='*', default=None,
                        help='FPN levels to visualize (default: all)')
+
+    # --- gtvis ---
+    p_gt = sub.add_parser('gtvis',
+                          help='GT annotation visualization (OBB + center)')
+    p_gt.add_argument('config', help='Config file path (for data paths)')
+    p_gt.add_argument('--images', nargs='*', default=None,
+                      help='Specific image filenames')
+    p_gt.add_argument('--num-images', type=int, default=10,
+                      help='Number of random images (if --images not given)')
+    p_gt.add_argument('--output-dir', '-o', default='vis_output',
+                      help='Output directory')
+    p_gt.add_argument('--seed', type=int, default=42, help='Random seed')
 
     args = parser.parse_args()
     if args.command is None:
@@ -654,6 +725,7 @@ def main():
         'detect': cmd_detect,
         'cpm': cmd_cpm,
         'varmap': cmd_varmap,
+        'gtvis': cmd_gtvis,
     }
     cmds[args.command](args)
 

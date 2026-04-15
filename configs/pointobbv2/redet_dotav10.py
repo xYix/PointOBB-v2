@@ -4,7 +4,7 @@ _base_ = [
 ]
 
 angle_version = 'le90'
-data_root = 'data/split_ss_dota_v10/'
+data_root = '/mnt/tmp/datasets/DOTAv10/split_ss_dota/'
 classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
            'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
            'basketball-court', 'storage-tank', 'soccer-ball-field',
@@ -28,9 +28,10 @@ train_pipeline = [
 ]
 
 data = dict(
+    samples_per_gpu=1,
     train=dict(
         pipeline=train_pipeline,
-        ann_file='your_pseudo_label_dir_path',
+        ann_file='/mnt/tmp/datasets/DOTAv10pseudolabel_vpd_v3e1_pca28',
         img_prefix=data_root + 'trainval/images/',
         version=angle_version,
         classes=classes),
@@ -56,7 +57,7 @@ model = dict(
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
         style='pytorch',
-        pretrained='work_dirs/pretrain_model/re_resnet50_c8_batch256-25b16846.pth'),
+        pretrained='checkpoints/re_resnet50_c8_batch256-25b16846.pth'),
     neck=dict(
         type='ReFPN',
         in_channels=[256, 512, 1024, 2048],
@@ -216,4 +217,17 @@ model = dict(
             nms=dict(iou_thr=0.1),
             max_per_img=2000)))
 
-optimizer = dict(lr=0.01)
+optimizer = dict(lr=0.005)
+
+lr_config = dict(
+    _delete_=True,
+    policy='step',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=0.3333333333333333,
+    step=[8, 11])
+
+runner = dict(type='EpochBasedRunner', max_epochs=12)
+evaluation = dict(interval=1, metric='mAP')
+
+load_from = None

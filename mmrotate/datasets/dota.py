@@ -78,6 +78,8 @@ class DOTADataset(CustomDataset):
                 data_infos.append(data_info)
         else:
             for ann_file in ann_files:
+                if 'compare_stat' in ann_file:
+                    continue
                 data_info = {}
                 img_id = osp.split(ann_file)[1][:-4]
                 img_name = img_id + '.png'

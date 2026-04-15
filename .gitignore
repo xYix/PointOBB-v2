@@ -117,7 +117,7 @@ dmypy.json
 .pyre/
 .DS_Store
 .idea
-*work_dirs*
+# *work_dirs*
 tmp
 
 # custom
@@ -130,4 +130,9 @@ mmrotate/.mim
 .data/
 *.md
 *.pdf
+vis_output_old/
+exps/
+visualization/
 vis_output/
+*.jpg
+*.png

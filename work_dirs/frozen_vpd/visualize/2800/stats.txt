@@ -1,0 +1,6 @@
+mu_dx:  min=-4.9490 max=5.0315 mean=0.2815 std=1.0572
+mu_dy:  min=-5.5695 max=7.2055 mean=-0.0088 std=1.2741
+sigma_dx: min=2.4144 max=4.8659 mean=3.7903 std=0.2071
+sigma_dy: min=2.4142 max=5.0034 mean=3.7903 std=0.2080
+log_sigma_dx: min=0.8815 max=1.5823 std=0.0568
+log_sigma_dy: min=0.8813 max=1.6101 std=0.0572
